@@ -46,6 +46,8 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {
     }
 
     nonisolated(unsafe) static var reply = Reply()
+    /// When set, replies per request. Used for flows that make several different calls.
+    nonisolated(unsafe) static var handler: ((URLRequest) -> Reply)?
     nonisolated(unsafe) static var requests: [(request: URLRequest, body: Data?)] = []
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -54,9 +56,10 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {
 
     override func startLoading() {
         Self.requests.append((request, Self.readBody(of: request)))
-        let response = HTTPURLResponse(url: request.url!, statusCode: Self.reply.status, httpVersion: nil, headerFields: nil)!
+        let reply = Self.handler?(request) ?? Self.reply
+        let response = HTTPURLResponse(url: request.url!, statusCode: reply.status, httpVersion: nil, headerFields: nil)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data(Self.reply.body.utf8))
+        client?.urlProtocol(self, didLoad: Data(reply.body.utf8))
         client?.urlProtocolDidFinishLoading(self)
     }
 
@@ -76,10 +79,13 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {
 }
 
 let linkURL = URL(string: "https://mealmate.capsule.cards/aB3dE5gH7j")!
-let created = #"{"public_id":"aB3dE5gH7j","url":"https://mealmate.capsule.cards/aB3dE5gH7j","edit_token":"token-1"}"#
+let created = #"{"public_id":"aB3dE5gH7j","url":"https://mealmate.capsule.cards/aB3dE5gH7j","edit_token":"token-1","attachments":[]}"#
+let updated = #"{"public_id":"aB3dE5gH7j","url":"https://mealmate.capsule.cards/aB3dE5gH7j","attachments":[]}"#
 
-func capsuleJSON(shareType: String = "recipe", version: String = "2", payload: String) -> String {
-    #"{"public_id":"aB3dE5gH7j","share_type":"\#(shareType)","schema_version":\#(version),"payload":\#(payload)}"#
+func capsuleJSON(
+    shareType: String = "recipe", version: String = "2", payload: String, attachments: String = "[]"
+) -> String {
+    #"{"public_id":"aB3dE5gH7j","share_type":"\#(shareType)","schema_version":\#(version),"payload":\#(payload),"attachments":\#(attachments)}"#
 }
 
 @Suite(.serialized)
@@ -89,6 +95,7 @@ final class CapsuleCardsTests {
 
     init() {
         StubProtocol.reply = .init()
+        StubProtocol.handler = nil
         StubProtocol.requests = []
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubProtocol.self]
@@ -158,6 +165,7 @@ final class CapsuleCardsTests {
 
     @Test func updateSendsTheEditToken() async throws {
         try tokens.save("token-1", for: "aB3dE5gH7j")
+        StubProtocol.reply = .init(body: updated)
         try await sdk.update(link(), with: Recipe(name: "Changed", servings: 2))
         #expect(lastRequest.httpMethod == "PATCH")
         #expect(lastRequest.url?.absoluteString == "https://api.capsule.cards/v1/capsules/aB3dE5gH7j")
@@ -168,6 +176,7 @@ final class CapsuleCardsTests {
 
     @Test func updateClearsFieldsTheValueNoLongerHas() async throws {
         try tokens.save("token-1", for: "aB3dE5gH7j")
+        StubProtocol.reply = .init(body: updated)
         try await sdk.update(link(), with: Note(text: "Changed"))
         #expect(lastBody["description"] as? String == "")
         #expect(lastBody["image_url"] as? String == "")

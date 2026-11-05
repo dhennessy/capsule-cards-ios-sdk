@@ -14,6 +14,8 @@ public enum CapsuleCardsError: Error, Equatable {
     case missingEditToken
     /// The value didn't encode to a JSON object, which is what a capsule's payload must be.
     case invalidPayload
+    /// An image's file isn't available, because it hasn't finished uploading or couldn't be downloaded.
+    case attachmentUnavailable
     /// The capsule was written with an older schema version and the type doesn't implement `migrate`.
     case migrationRequired(fromVersion: Int)
 }
@@ -40,6 +42,8 @@ extension CapsuleCardsError: LocalizedError {
             return "This device can't change this capsule"
         case .invalidPayload:
             return "The value couldn't be encoded as a JSON object"
+        case .attachmentUnavailable:
+            return "This image isn't available"
         case .migrationRequired(let version):
             return "This capsule uses schema version \(version), which this app can't read"
         }
