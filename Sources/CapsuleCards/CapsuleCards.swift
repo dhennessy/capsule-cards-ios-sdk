@@ -62,10 +62,14 @@ public final class CapsuleCards: Sendable {
 
     /// Creates a capsule from the value and returns its link, ready for the share sheet.
     public func share<Value: Shareable>(_ value: Value) async throws -> CapsuleLink {
-        var body = try Self.fields(for: value)
+        let (fields, images) = try Self.fields(for: value)
+        var body = fields
         body["share_type"] = Value.shareType
+        if !images.isEmpty {
+            body["attachments"] = try Self.attachmentFields(for: images, preview: value.preview.image)
+        }
         let data = try await send("POST", to: apiURL, body: body)
-        let created = try Self.decode(CreatedCapsule.self, from: data)
+        let created = try Self.decode(CapsuleResponse.self, from: data)
         guard let link = CapsuleLink(url: created.url) else {
             throw CapsuleCardsError.invalidResponse
         }
@@ -77,14 +81,26 @@ public final class CapsuleCards: Sendable {
                 Self.logger.error("Couldn't save the edit token for \(link.publicID): \(error)")
             }
         }
+        do {
+            try await upload(created.attachments, images: images, to: link, editToken: created.editToken)
+        } catch {
+            // A link that's missing its image shouldn't be left behind.
+            try? await delete(link)
+            throw error
+        }
         return link
     }
 
     /// Updates a capsule in place. Its card and payload change at the same URL, within about a minute.
     public func update<Value: Shareable>(_ link: CapsuleLink, with value: Value) async throws {
         let token = try editToken(for: link)
+        let (fields, images) = try Self.fields(for: value)
+        var body = fields
+        body["attachments"] = try Self.attachmentFields(for: images, preview: value.preview.image)
         let url = apiURL.appendingPathComponent(link.publicID)
-        try await send("PATCH", to: url, body: Self.fields(for: value), editToken: token)
+        let data = try await send("PATCH", to: url, body: body, editToken: token)
+        let updated = try Self.decode(CapsuleResponse.self, from: data)
+        try await upload(updated.attachments, images: images, to: link, editToken: token)
     }
 
     /// Deletes a capsule. Its link stays live and shows a "no longer available" page.
@@ -112,7 +128,8 @@ public final class CapsuleCards: Sendable {
         guard
             let capsule = try JSONSerialization.jsonObject(with: data) as? [String: Any],
             let shareType = capsule["share_type"] as? String,
-            let payload = capsule["payload"] as? [String: Any]
+            let payload = capsule["payload"] as? [String: Any],
+            let attachmentList = capsule["attachments"]
         else {
             throw CapsuleCardsError.invalidResponse
         }
@@ -123,18 +140,78 @@ public final class CapsuleCards: Sendable {
         if let stored = capsule["schema_version"] as? Int, stored < Value.schemaVersion {
             return try Value.migrate(payloadData, from: stored)
         }
-        return try Self.payloadDecoder().decode(Value.self, from: payloadData)
+        let attachments = try Self.decode(
+            [ReceivedAttachment].self, from: JSONSerialization.data(withJSONObject: attachmentList))
+        let decoder = Self.payloadDecoder()
+        decoder.userInfo[.receivedAttachments] = Dictionary(
+            attachments.map { ($0.filename, $0) }, uniquingKeysWith: { first, _ in first })
+        return try decoder.decode(Value.self, from: payloadData)
     }
 
     // MARK: Implementation
 
-    private struct CreatedCapsule: Decodable {
+    private struct CapsuleResponse: Decodable {
         let url: URL
         let editToken: String?
+        let attachments: [AttachmentResponse]
 
         enum CodingKeys: String, CodingKey {
             case url
             case editToken = "edit_token"
+            case attachments
+        }
+    }
+
+    private struct AttachmentResponse: Decodable {
+        let uuid: String
+        let filename: String
+        let upload: Upload?
+    }
+
+    private struct Upload: Decodable {
+        let url: URL
+        let method: String
+        let headers: [String: String]
+    }
+
+    /// Uploads each file the service is waiting for, straight to storage, and marks it complete.
+    private func upload(
+        _ attachments: [AttachmentResponse],
+        images: [CapsuleImage],
+        to link: CapsuleLink,
+        editToken: String?
+    ) async throws {
+        for attachment in attachments {
+            guard let upload = attachment.upload else {
+                continue
+            }
+            guard let data = images.first(where: { $0.filename == attachment.filename })?.uploadableData else {
+                throw CapsuleCardsError.attachmentUnavailable
+            }
+            var request = URLRequest(url: upload.url)
+            request.httpMethod = upload.method
+            for (name, value) in upload.headers {
+                request.setValue(value, forHTTPHeaderField: name)
+            }
+            let (body, response) = try await session.upload(for: request, from: data)
+            try Self.validate(response, data: body)
+            let complete = apiURL.appendingPathComponent(
+                "\(link.publicID)/attachments/\(attachment.uuid)/complete")
+            try await send("POST", to: complete, editToken: editToken)
+        }
+    }
+
+    private static func attachmentFields(for images: [CapsuleImage], preview: CapsuleImage?) throws -> [[String: Any]] {
+        try images.map { image in
+            guard let size = image.size else {
+                throw CapsuleCardsError.attachmentUnavailable
+            }
+            return [
+                "filename": image.filename,
+                "content_type": image.contentType,
+                "size": size,
+                "is_preview": image.filename == preview?.filename,
+            ]
         }
     }
 
@@ -154,25 +231,33 @@ public final class CapsuleCards: Sendable {
         return token
     }
 
-    private static func fields<Value: Shareable>(for value: Value) throws -> [String: Any] {
+    private static func fields<Value: Shareable>(for value: Value) throws -> ([String: Any], [CapsuleImage]) {
+        let collector = AttachmentCollector()
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
+        encoder.userInfo[.attachmentCollector] = collector
         guard let payload = try JSONSerialization.jsonObject(with: encoder.encode(value)) as? [String: Any] else {
             throw CapsuleCardsError.invalidPayload
         }
         let preview = value.preview
+        if let image = preview.image {
+            collector.add(image)
+        }
         var fields: [String: Any] = [
             "title": preview.title,
             // Empty rather than absent, so that an update can clear a field.
             "description": preview.description ?? "",
-            "image_url": preview.imageURL?.absoluteString ?? "",
             "og_type": preview.type ?? "",
             "payload": payload,
         ]
+        // An uploaded preview sets the image URL when it completes, and an update mustn't clear that.
+        if preview.image == nil {
+            fields["image_url"] = preview.imageURL?.absoluteString ?? ""
+        }
         if Value.schemaVersion > 0 {
             fields["schema_version"] = Value.schemaVersion
         }
-        return fields
+        return (fields, collector.images)
     }
 
     private static func payloadDecoder() -> JSONDecoder {
@@ -207,12 +292,17 @@ public final class CapsuleCards: Sendable {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         }
         let (data, response) = try await session.data(for: request)
+        try Self.validate(response, data: data)
+        return data
+    }
+
+    private static func validate(_ response: URLResponse, data: Data) throws {
         guard let http = response as? HTTPURLResponse else {
             throw CapsuleCardsError.invalidResponse
         }
         switch http.statusCode {
         case 200...299:
-            return data
+            return
         case 404:
             throw CapsuleCardsError.capsuleNotFound
         case 410:

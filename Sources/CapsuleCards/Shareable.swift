@@ -43,12 +43,21 @@ public struct CapsulePreview: Hashable, Sendable {
     public var title: String
     public var description: String?
     public var imageURL: URL?
+    /// An image to upload and use as the preview. It takes priority over `imageURL`.
+    public var image: CapsuleImage?
     /// The Open Graph type, such as `article`. Defaults to `website` on the card.
     public var type: String?
 
-    public init(title: String, description: String? = nil, imageURL: URL? = nil, type: String? = nil) {
+    public init(
+        title: String,
+        description: String? = nil,
+        image: CapsuleImage? = nil,
+        imageURL: URL? = nil,
+        type: String? = nil
+    ) {
         self.title = title
         self.description = description
+        self.image = image
         self.imageURL = imageURL
         self.type = type
     }
