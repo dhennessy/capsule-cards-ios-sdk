@@ -1,287 +1,224 @@
 import Foundation
-import UniformTypeIdentifiers
+import os
 
-public struct Attachment: Codable {
-    public let capsuleUUID: String
-    public let contentType: String?
-    public let createdAt: Date
-    public let filename: String?
-    public let updatedAt: Date
-    public let url: URL?
-    public let uuid: String
+/// Shares your app's model values as links, and turns incoming links back into those values.
+///
+/// ```swift
+/// CapsuleCards.configure(publishableKey: "cc_pk_live_…")
+///
+/// let link = try await CapsuleCards.shared.share(recipe)
+/// ShareLink(item: link.url)
+///
+/// .onOpenURL { url in
+///     Task {
+///         if let recipe = try await CapsuleCards.shared.capsule(from: url, as: Recipe.self) { … }
+///     }
+/// }
+/// ```
+public final class CapsuleCards: Sendable {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var configured: CapsuleCards?
 
-    enum CodingKeys: String, CodingKey {
-        case capsuleUUID = "capsule_uuid"
-        case contentType = "content_type"
-        case createdAt = "created_at"
-        case filename
-        case updatedAt = "updated_at"
-        case url
-        case uuid
-    }
-}
+    private static let logger = Logger(subsystem: "cards.capsule.sdk", category: "CapsuleCards")
+    private static let editTokenHeader = "X-Capsule-Edit-Token"
 
-fileprivate struct AttachmentCreateRequest: Encodable {
-    public let contentType: String?
-    public let filename: String?
-    public let url: URL?
+    private let publishableKey: String
+    private let apiURL: URL
+    private let session: URLSession
+    private let editTokens: any EditTokenStore
 
-    enum CodingKeys: String, CodingKey {
-        case contentType = "content_type"
-        case filename
-        case url
-    }
-}
-
-fileprivate struct AttachmentUploadParams: Codable {
-    public let fields: [String: String]
-    public let url: URL
-}
-
-public struct Capsule: Codable {
-    public let createdAt: Date
-    public let description: String?
-    public let imageURL: URL?
-    public let publicURL: URL
-    public let templateUUID: String
-    public let title: String
-    public let type: String?
-    public let updatedAt: Date
-    public let uuid: String
-
-    enum CodingKeys: String, CodingKey {
-        case createdAt = "created_at"
-        case description
-        case imageURL = "image_url"
-        case publicURL = "public_url"
-        case templateUUID = "template_uuid"
-        case title
-        case type
-        case updatedAt = "updated_at"
-        case uuid
-    }
-}
-
-fileprivate struct CapsuleCreateRequest: Encodable {
-    let title: String
-    let description: String?
-    let imageURL: URL?
-    let type: String?
-    let templateUUID: String
-
-    enum CodingKeys: String, CodingKey {
-        case title
-        case description
-        case imageURL = "image_url"
-        case type
-        case templateUUID = "template_uuid"
-    }
-}
-
-fileprivate struct CapsuleUpdateRequest: Encodable {
-    let title: String?
-    let description: String?
-    let imageURL: URL?
-    let type: String?
-
-    enum CodingKeys: String, CodingKey {
-        case title
-        case description
-        case imageURL = "image_url"
-        case type
-    }
-}
-
-
-fileprivate struct MultipartFormDataBuilder {
-    let boundary: String
-    private let body = NSMutableData()
-
-    func addField(name: String, value: String) {
-        var fieldString = "--\(boundary)\r\n"
-        fieldString += "Content-Disposition: form-data; name=\"\(name)\"\r\n"
-        fieldString += "\r\n"
-        fieldString += "\(value)\r\n"
-        body.append(fieldString.data(using: .utf8)!)
-    }
-    
-    func addFile(name: String, filename: String, data: Data, contentType: String) {
-        var fieldString = "--\(boundary)\r\n"
-        fieldString += "Content-Disposition: form-data; name=\"file\"; filename=\"\(filename)\"\r\n"
-        fieldString += "Content-Type: \(contentType)\r\n"
-        fieldString += "\r\n"
-        body.append(fieldString.data(using: .utf8)!)
-        body.append(data)
-        body.append("\r\n".data(using: .utf8)!)
-    }
-    
-    func addFinalBoundary() {
-        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
-    }
-    
-    var data: Data {
-        body as Data
-    }
-}
-
-public struct Client {
-    let baseURL: URL
-    let session: URLSession
-    public var apiKey: String
-    
-    public init(apiKey: String, baseURL: URL = URL(string: "https://api.capsule.cards/v1/capsules/")!, session: URLSession = .shared) {
-        self.apiKey = apiKey
-        self.baseURL = baseURL
-        self.session = session
-    }
-    
-    public func createCapsule(title: String, templateUUID: String, description: String? = nil, imageURL: URL? = nil, type: String? = nil) async throws -> Capsule {
-        let body = CapsuleCreateRequest(title: title, description: description, imageURL: imageURL, type: type, templateUUID: templateUUID)
-        let jsonEncoder = JSONEncoder()
-        jsonEncoder.outputFormatting = [.prettyPrinted]
-        let jsonData = try jsonEncoder.encode(body)
-        
-        var request = URLRequest(url: baseURL)
-        request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = jsonData
-        let (data, response) = try await session.data(for: request)
-        
-        try validateHttpResponse(data: data, response: response)
-        return try getJSONDecoder().decode(Capsule.self, from: data)
-    }
-    
-    public func getCapsule(uuid: String) async throws -> Capsule {
-        let url = baseURL.appendingPathComponent("\(uuid)/")
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let (data, response) = try await session.data(for: request)
-        try validateHttpResponse(data: data, response: response)
-        return try getJSONDecoder().decode(Capsule.self, from: data)
-    }
-    
-    public func updateCapsule(uuid: String, title: String? = nil, description: String? = nil, imageURL: URL? = nil, type: String? = nil) async throws -> Capsule {
-        let body = CapsuleUpdateRequest(title: title, description: description, imageURL: imageURL, type: type)
-        let jsonEncoder = JSONEncoder()
-        jsonEncoder.outputFormatting = [.prettyPrinted]
-        let jsonData = try jsonEncoder.encode(body)
-
-        let url = baseURL.appendingPathComponent("\(uuid)")
-        var request = URLRequest(url: url)
-        request.httpMethod = "PATCH"
-        request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = jsonData
-        let (data, response) = try await session.data(for: request)
-        
-        try validateHttpResponse(data: data, response: response)
-        return try getJSONDecoder().decode(Capsule.self, from: data)
+    /// Sets up the shared instance. Call this once, when your app launches.
+    public static func configure(publishableKey: String) {
+        let instance = CapsuleCards(publishableKey: publishableKey)
+        lock.withLock { configured = instance }
     }
 
-    public func getAttachment(capsuleUUID: String, uuid: String) async throws -> Attachment {
-        let url = baseURL.appendingPathComponent("\(capsuleUUID)/attachments/\(uuid)")
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let (data, response) = try await session.data(for: request)
-        try validateHttpResponse(data: data, response: response)
-        return try getJSONDecoder().decode(Attachment.self, from: data)
-    }
-    
-    public func createAttachment(capsuleUUID: String, filename: String, contentType: String? = nil) async throws -> Attachment {
-        let body = AttachmentCreateRequest(contentType: contentType, filename: filename, url: nil)
-        let jsonEncoder = JSONEncoder()
-        jsonEncoder.outputFormatting = [.prettyPrinted]
-        let jsonData = try jsonEncoder.encode(body)
-
-        let url = baseURL.appendingPathComponent("\(capsuleUUID)/attachments")
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = jsonData
-        let (data, response) = try await session.data(for: request)
-
-        try validateHttpResponse(data: data, response: response)
-        return try getJSONDecoder().decode(Attachment.self, from: data)
-    }
-
-    fileprivate func getAttachmentUploadParams(capsuleUUID: String, attachmentUUID: String) async throws -> AttachmentUploadParams {
-        let url = baseURL.appendingPathComponent("\(capsuleUUID)/attachments/\(attachmentUUID)/upload")
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "X-API-Key")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let (data, response) = try await session.data(for: request)
-
-        try validateHttpResponse(data: data, response: response)
-        return try getJSONDecoder().decode(AttachmentUploadParams.self, from: data)
-    }
-    
-    fileprivate func uploadImageData(to url: URL, fields: [String: String], data: Data, filename: String, contentType: String?) async throws {
-        let boundary = "Boundary-\(UUID().uuidString)"
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        let builder = MultipartFormDataBuilder(boundary: boundary)
-        for (key, value) in fields {
-            builder.addField(name: key, value: value)
+    public static var shared: CapsuleCards {
+        guard let instance = lock.withLock({ configured }) else {
+            preconditionFailure("Call CapsuleCards.configure(publishableKey:) before using CapsuleCards.shared.")
         }
-        builder.addFile(name: filename, filename: filename, data: data, contentType: contentType ?? "application/octet-stream")
-        builder.addFinalBoundary()
-        request.httpBody = builder.data
-        let (data, response) = try await session.data(for: request)
-        
-        try validateHttpResponse(data: data, response: response)
+        return instance
     }
-    
-    public func createAttachment(capsuleUUID: String, filename: String, contentType: String? = nil, data: Data) async throws -> Attachment {
-        var attachment = try await createAttachment(capsuleUUID: capsuleUUID, filename: filename, contentType: contentType)
-        let uploadParams = try await getAttachmentUploadParams(capsuleUUID: capsuleUUID, attachmentUUID: attachment.uuid)
-        try await uploadImageData(to: uploadParams.url, fields: uploadParams.fields, data: data, filename: filename, contentType: contentType)
-        attachment = try await getAttachment(capsuleUUID: capsuleUUID, uuid: attachment.uuid)
 
-        return attachment
+    public convenience init(publishableKey: String) {
+        self.init(publishableKey: publishableKey, session: .shared, editTokens: KeychainEditTokenStore())
     }
-    
-    // MARK: Implementation helpers
-    
-    private func validateHttpResponse(data: Data, response: URLResponse) throws {
+
+    init(
+        publishableKey: String,
+        apiURL: URL = URL(string: "https://api.capsule.cards/v1/capsules")!,
+        session: URLSession,
+        editTokens: any EditTokenStore
+    ) {
+        // A secret key has full access to the app's capsules, and anyone can extract it from an app binary.
+        precondition(!publishableKey.hasPrefix("cc_sk_"), "Never put a secret key in your app. Use a publishable key.")
+        self.publishableKey = publishableKey
+        self.apiURL = apiURL
+        self.session = session
+        self.editTokens = editTokens
+    }
+
+    // MARK: Sharing
+
+    /// Creates a capsule from the value and returns its link, ready for the share sheet.
+    public func share<Value: Shareable>(_ value: Value) async throws -> CapsuleLink {
+        var body = try Self.fields(for: value)
+        body["share_type"] = Value.shareType
+        let data = try await send("POST", to: apiURL, body: body)
+        let created = try Self.decode(CreatedCapsule.self, from: data)
+        guard let link = CapsuleLink(url: created.url) else {
+            throw CapsuleCardsError.invalidResponse
+        }
+        if let token = created.editToken {
+            do {
+                try editTokens.save(token, for: link.publicID)
+            } catch {
+                // The capsule exists and the link works, so still return it. It just can't be edited from here.
+                Self.logger.error("Couldn't save the edit token for \(link.publicID): \(error)")
+            }
+        }
+        return link
+    }
+
+    /// Updates a capsule in place. Its card and payload change at the same URL, within about a minute.
+    public func update<Value: Shareable>(_ link: CapsuleLink, with value: Value) async throws {
+        let token = try editToken(for: link)
+        let url = apiURL.appendingPathComponent(link.publicID)
+        try await send("PATCH", to: url, body: Self.fields(for: value), editToken: token)
+    }
+
+    /// Deletes a capsule. Its link stays live and shows a "no longer available" page.
+    public func delete(_ link: CapsuleLink) async throws {
+        let token = try editToken(for: link)
+        do {
+            try await send("DELETE", to: apiURL.appendingPathComponent(link.publicID), editToken: token)
+        } catch CapsuleCardsError.capsuleDeleted {
+            // Already gone, which is what the caller wanted.
+        }
+        try editTokens.remove(for: link.publicID)
+    }
+
+    // MARK: Receiving
+
+    /// Turns an incoming link into a value of your type.
+    ///
+    /// Returns `nil` if the URL isn't a capsule link, or if the capsule is of a different share type, so you can
+    /// try each of your types in turn.
+    public func capsule<Value: Shareable>(from url: URL, as type: Value.Type) async throws -> Value? {
+        guard let link = CapsuleLink(url: url), let readURL = Self.readURL(for: link) else {
+            return nil
+        }
+        let data = try await send("GET", to: readURL)
+        guard
+            let capsule = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let shareType = capsule["share_type"] as? String,
+            let payload = capsule["payload"] as? [String: Any]
+        else {
+            throw CapsuleCardsError.invalidResponse
+        }
+        guard shareType == Value.shareType else {
+            return nil
+        }
+        let payloadData = try JSONSerialization.data(withJSONObject: payload)
+        if let stored = capsule["schema_version"] as? Int, stored < Value.schemaVersion {
+            return try Value.migrate(payloadData, from: stored)
+        }
+        return try Self.payloadDecoder().decode(Value.self, from: payloadData)
+    }
+
+    // MARK: Implementation
+
+    private struct CreatedCapsule: Decodable {
+        let url: URL
+        let editToken: String?
+
+        enum CodingKeys: String, CodingKey {
+            case url
+            case editToken = "edit_token"
+        }
+    }
+
+    /// Reads go to the link's own hostname, which is served from the edge rather than the API.
+    private static func readURL(for link: CapsuleLink) -> URL? {
+        var components = URLComponents(url: link.url, resolvingAgainstBaseURL: false)
+        components?.path = "/v1/capsules/\(link.publicID)"
+        components?.query = nil
+        components?.fragment = nil
+        return components?.url
+    }
+
+    private func editToken(for link: CapsuleLink) throws -> String {
+        guard let token = try editTokens.token(for: link.publicID) else {
+            throw CapsuleCardsError.missingEditToken
+        }
+        return token
+    }
+
+    private static func fields<Value: Shareable>(for value: Value) throws -> [String: Any] {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let payload = try JSONSerialization.jsonObject(with: encoder.encode(value)) as? [String: Any] else {
+            throw CapsuleCardsError.invalidPayload
+        }
+        let preview = value.preview
+        var fields: [String: Any] = [
+            "title": preview.title,
+            // Empty rather than absent, so that an update can clear a field.
+            "description": preview.description ?? "",
+            "image_url": preview.imageURL?.absoluteString ?? "",
+            "og_type": preview.type ?? "",
+            "payload": payload,
+        ]
+        if Value.schemaVersion > 0 {
+            fields["schema_version"] = Value.schemaVersion
+        }
+        return fields
+    }
+
+    private static func payloadDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+
+    private static func decode<Value: Decodable>(_ type: Value.Type, from data: Data) throws -> Value {
+        do {
+            return try JSONDecoder().decode(type, from: data)
+        } catch {
+            throw CapsuleCardsError.invalidResponse
+        }
+    }
+
+    @discardableResult
+    private func send(
+        _ method: String,
+        to url: URL,
+        body: [String: Any]? = nil,
+        editToken: String? = nil
+    ) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue("Bearer \(publishableKey)", forHTTPHeaderField: "Authorization")
+        if let editToken {
+            request.setValue(editToken, forHTTPHeaderField: Self.editTokenHeader)
+        }
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw CapsuleCardsError.invalidResponse
         }
-        
         switch http.statusCode {
         case 200...299:
-            return
-            
-        case 400...599:
-            let body = String(data: data, encoding: .utf8) ?? ""
-            throw CapsuleCardsError.requestError(http.statusCode, body)
-            
+            return data
+        case 404:
+            throw CapsuleCardsError.capsuleNotFound
+        case 410:
+            throw CapsuleCardsError.capsuleDeleted
         default:
-            throw CapsuleCardsError.invalidResponse
+            throw CapsuleCardsError.requestError(http.statusCode, String(decoding: data, as: UTF8.self))
         }
-    }
-    
-    private func getJSONDecoder() -> JSONDecoder {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .custom { decoder in
-            let container = try decoder.singleValueContainer()
-            let dateString = try container.decode(String.self)
-            
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let date = formatter.date(from: dateString) {
-                return date
-            } else {
-                throw DecodingError.dataCorruptedError(in: container, debugDescription: "Cannot decode date string \(dateString)")
-            }
-        }
-        return decoder
     }
 }
