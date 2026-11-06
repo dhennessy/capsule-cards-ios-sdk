@@ -21,11 +21,13 @@ public final class CapsuleCards: Sendable {
 
     private static let logger = Logger(subsystem: "cards.capsule.sdk", category: "CapsuleCards")
     private static let editTokenHeader = "X-Capsule-Edit-Token"
+    private static let deviceSessionHeader = "X-Capsule-Device-Session"
 
     private let publishableKey: String
     private let apiURL: URL
     private let session: URLSession
     private let editTokens: any EditTokenStore
+    private let deviceSession: DeviceSession
 
     /// Sets up the shared instance. Call this once, when your app launches.
     public static func configure(publishableKey: String) {
@@ -48,7 +50,9 @@ public final class CapsuleCards: Sendable {
         publishableKey: String,
         apiURL: URL = URL(string: "https://api.capsule.cards/v1/capsules")!,
         session: URLSession,
-        editTokens: any EditTokenStore
+        editTokens: any EditTokenStore,
+        attester: any DeviceAttester = AppleDeviceAttester(),
+        attestationKeys: any EditTokenStore = KeychainEditTokenStore(service: "cards.capsule.attest-key")
     ) {
         // A secret key has full access to the app's capsules, and anyone can extract it from an app binary.
         precondition(!publishableKey.hasPrefix("cc_sk_"), "Never put a secret key in your app. Use a publishable key.")
@@ -56,6 +60,12 @@ public final class CapsuleCards: Sendable {
         self.apiURL = apiURL
         self.session = session
         self.editTokens = editTokens
+        deviceSession = DeviceSession(
+            attester: attester,
+            keys: attestationKeys,
+            baseURL: apiURL.deletingLastPathComponent(),
+            publishableKey: publishableKey,
+            session: session)
     }
 
     // MARK: Sharing
@@ -286,6 +296,10 @@ public final class CapsuleCards: Sendable {
         request.setValue("Bearer \(publishableKey)", forHTTPHeaderField: "Authorization")
         if let editToken {
             request.setValue(editToken, forHTTPHeaderField: Self.editTokenHeader)
+        }
+        // Reads go to the edge, which doesn't use this. Only writes to the API need to prove the device.
+        if method != "GET", let token = await deviceSession.currentToken() {
+            request.setValue(token, forHTTPHeaderField: Self.deviceSessionHeader)
         }
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")

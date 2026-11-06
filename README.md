@@ -46,4 +46,8 @@ Updates can take about a minute to appear, because the service caches capsules a
 updated or deleted from the device that shared them, because each capsule's edit token stays in that device's
 Keychain.
 
+The SDK uses App Attest automatically on supported devices. Add the App Attest capability to your app, then choose
+`Report` or `Enforce` for the app in the dashboard. Attestation can't run in the Simulator, so use `Off` or `Report`
+during development.
+
 Use only your publishable key in your app. The SDK stops with an error if you give it a secret key.
