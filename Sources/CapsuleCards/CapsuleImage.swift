@@ -15,8 +15,11 @@ public struct CapsuleImage: Codable, Hashable, Sendable {
     private let bytes: Data?
 
     /// An image to share, from JPEG data.
-    public init(jpeg data: Data) {
-        filename = "\(UUID().uuidString.lowercased()).jpg"
+    ///
+    /// - Parameter filename: Shown on the web card if the image is offered as a download. Use letters, digits, dots,
+    ///   hyphens and underscores, and keep it unique within the capsule. Defaults to a random name.
+    public init(jpeg data: Data, filename: String? = nil) {
+        self.filename = filename ?? "\(UUID().uuidString.lowercased()).jpg"
         contentType = "image/jpeg"
         url = nil
         size = data.count

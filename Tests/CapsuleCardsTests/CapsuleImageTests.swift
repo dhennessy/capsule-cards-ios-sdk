@@ -118,6 +118,10 @@ extension CapsuleCardsTests {
         #expect(try await CapsuleImage(jpeg: Data([9])).data() == Data([9]))
     }
 
+    @Test func anImageCanBeGivenAFilename() {
+        #expect(CapsuleImage(jpeg: Data(), filename: "photo.jpg").filename == "photo.jpg")
+    }
+
     @Test func eachImageGetsItsOwnFilename() {
         #expect(CapsuleImage(jpeg: Data()).filename != CapsuleImage(jpeg: Data()).filename)
     }
